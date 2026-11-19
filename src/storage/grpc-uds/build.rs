@@ -21,6 +21,7 @@ fn main() {
             .out_dir("src/generated/protos")
             .bytes(".gcscore.v1.ReadChunk.data")
             .bytes(".gcscore.v1.WriteRequest.data")
+            .bytes(".gcscore.v1.AppendRequest.data")
             .bytes(".gcscore.v1.PingRequest.payload")
             .bytes(".gcscore.v1.PingResponse.payload")
             .compile_protos(&["proto/gcscore.proto"], &["proto"])

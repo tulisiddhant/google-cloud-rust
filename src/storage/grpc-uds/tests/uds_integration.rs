@@ -19,9 +19,14 @@ use httptest::{Expectation, Server as HttpServer, matchers::*, responders::*};
 use hyper_util::rt::TokioIo;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+#[cfg(google_cloud_unstable_storage_bidi)]
 use storage_grpc_mock::google::storage::v2::{
-    BidiReadObjectResponse, ChecksummedData, Object as ProtoObject, ObjectRangeData,
-    ReadRange as ProtoRange,
+    BidiWriteHandle, BidiWriteObjectResponse, bidi_write_object_request,
+    bidi_write_object_response::WriteStatus,
+};
+use storage_grpc_mock::google::storage::v2::{
+    BidiReadObjectResponse, ChecksummedData, Object as ProtoObject, ObjectChecksums,
+    ObjectRangeData, ReadRange as ProtoRange,
 };
 use storage_grpc_mock::{MockStorage, start as start_grpc_mock};
 use storage_grpc_uds::pb::gcs_core_client::GcsCoreClient;
@@ -576,6 +581,9 @@ async fn read_write_and_list_over_uds_via_httptest() -> anyhow::Result<()> {
                 known_size: Some(11),
                 chunk_size: 0,
                 transport: Transport::Json as i32,
+                appendable: false,
+                finalize_on_close: None,
+                generation: None,
             })),
         },
         WriteRequest {
@@ -695,6 +703,7 @@ async fn open_object_read_range_and_close_via_grpc_mock() -> anyhow::Result<()> 
         bucket: "bidi-bucket".to_string(),
         object: "bidi-obj".to_string(),
         generation: 0,
+        if_generation_match: Some(555),
     });
     open_req
         .metadata_mut()
@@ -904,5 +913,368 @@ async fn json_404_and_412_status_mapping_and_inproc_lifecycle() -> anyhow::Resul
         !inproc_sock.exists(),
         "inproc socket should be removed after gcs_core_stop_inproc"
     );
+
+    // Verify gcs_core_start_inproc_with_options C-FFI lifecycle
+    let inproc_opt_sock = dir.path().join("inproc-opt.sock");
+    let c_opt_sock = std::ffi::CString::new(inproc_opt_sock.to_string_lossy().as_bytes())?;
+    let c_transport = std::ffi::CString::new("grpc")?;
+    let c_endpoint = std::ffi::CString::new("http://127.0.0.1:1")?;
+    let opt_rc = unsafe {
+        storage_grpc_uds::gcs_core_start_inproc_with_options(
+            c_opt_sock.as_ptr(),
+            c_transport.as_ptr(),
+            8,
+            c_endpoint.as_ptr(),
+        )
+    };
+    assert_eq!(
+        opt_rc, 0,
+        "gcs_core_start_inproc_with_options must return 0"
+    );
+    {
+        let mut opt_client = connect_uds(inproc_opt_sock.clone()).await?;
+        let pong = opt_client
+            .ping(PingRequest {
+                payload: Bytes::from_static(b"inproc-opts-ok"),
+            })
+            .await?
+            .into_inner();
+        assert_eq!(pong.payload, Bytes::from_static(b"inproc-opts-ok"));
+    }
+    assert_eq!(
+        unsafe { storage_grpc_uds::gcs_core_stop_inproc(c_opt_sock.as_ptr()) },
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_delete_and_append_object_over_uds_via_grpc_mock() -> anyhow::Result<()> {
+    let mut mock = MockStorage::new();
+
+    // 1. GetObject: hit for existing object, NotFound for missing object
+    mock.expect_get_object().returning(|req| {
+        let r = req.into_inner();
+        if r.object == "present.bin" {
+            Ok(tonic::Response::new(ProtoObject {
+                name: "present.bin".to_string(),
+                bucket: r.bucket,
+                size: 4096,
+                generation: 777,
+                metageneration: 2,
+                content_type: "application/octet-stream".to_string(),
+                storage_class: "RAPID".to_string(),
+                etag: "etag-777".to_string(),
+                checksums: Some(ObjectChecksums {
+                    crc32c: Some(0x12345678),
+                    ..ObjectChecksums::default()
+                }),
+                ..ProtoObject::default()
+            }))
+        } else {
+            Err(tonic::Status::not_found("object not found"))
+        }
+    });
+
+    // 2. DeleteObject: hit for existing object, NotFound for already-deleted object
+    mock.expect_delete_object().returning(|req| {
+        let r = req.into_inner();
+        if r.object == "present.bin" {
+            Ok(tonic::Response::new(()))
+        } else {
+            Err(tonic::Status::not_found("object not found"))
+        }
+    });
+
+    // 3. BidiWriteObject: support AppendObject with Flush + CloseWithoutFinalizing + Reopen + Finalize
+    #[cfg(google_cloud_unstable_storage_bidi)]
+    {
+        let shared_persisted = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        mock.expect_bidi_write_object().returning(move |request| {
+            let persisted_cell = shared_persisted.clone();
+            let (_, _, mut requests) = request.into_parts();
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            tokio::spawn(async move {
+                while let Some(Ok(req)) = requests.recv().await {
+                    if let Some(bidi_write_object_request::Data::ChecksummedData(cd)) = &req.data {
+                        persisted_cell.fetch_add(cd.content.len() as i64, Ordering::SeqCst);
+                    }
+                    let persisted = persisted_cell.load(Ordering::SeqCst);
+                    if matches!(
+                        req.first_message,
+                        Some(bidi_write_object_request::FirstMessage::WriteObjectSpec(_))
+                            | Some(bidi_write_object_request::FirstMessage::AppendObjectSpec(_))
+                    ) && !req.finish_write
+                    {
+                        let _ = tx
+                            .send(Ok(BidiWriteObjectResponse {
+                                write_status: Some(WriteStatus::Resource(ProtoObject {
+                                    bucket: "projects/_/buckets/zonal-bkt".to_string(),
+                                    name: "append.bin".to_string(),
+                                    generation: 888,
+                                    size: persisted,
+                                    ..ProtoObject::default()
+                                })),
+                                write_handle: Some(BidiWriteHandle {
+                                    handle: b"wh-888".to_vec(),
+                                }),
+                                persisted_data_checksums: None,
+                            }))
+                            .await;
+                        continue;
+                    }
+                    if req.finish_write {
+                        let _ = tx
+                            .send(Ok(BidiWriteObjectResponse {
+                                write_status: Some(WriteStatus::Resource(ProtoObject {
+                                    bucket: "projects/_/buckets/zonal-bkt".to_string(),
+                                    name: "append.bin".to_string(),
+                                    generation: 888,
+                                    size: persisted,
+                                    finalize_time: Some(Default::default()),
+                                    checksums: Some(ObjectChecksums {
+                                        crc32c: Some(0xCAFEBABE),
+                                        ..ObjectChecksums::default()
+                                    }),
+                                    ..ProtoObject::default()
+                                })),
+                                write_handle: Some(BidiWriteHandle {
+                                    handle: b"wh-888".to_vec(),
+                                }),
+                                persisted_data_checksums: None,
+                            }))
+                            .await;
+                        break;
+                    } else if req.flush && req.state_lookup {
+                        let _ = tx
+                            .send(Ok(BidiWriteObjectResponse {
+                                write_status: Some(WriteStatus::PersistedSize(persisted)),
+                                write_handle: Some(BidiWriteHandle {
+                                    handle: b"wh-888".to_vec(),
+                                }),
+                                persisted_data_checksums: None,
+                            }))
+                            .await;
+                    }
+                }
+            });
+            Ok(tonic::Response::from(rx))
+        });
+    }
+
+    let (mock_endpoint, _mock_srv) = start_grpc_mock("127.0.0.1:0", mock).await?;
+    let dir = tempfile::tempdir()?;
+    let sock_path = dir.path().join("control-append.sock");
+
+    let args = Args {
+        socket: sock_path.to_string_lossy().to_string(),
+        idle_secs: 0,
+        shm_size: 0,
+        default_transport: "grpc".to_string(),
+        endpoint: Some(mock_endpoint),
+        ..Default::default()
+    };
+
+    let listener = bind_uds_listener(&args.socket)
+        .map_err(|e| anyhow::anyhow!("bind_uds_listener failed: {e}"))?;
+    let shared = Shared::new();
+    let srv_shared = shared.clone();
+    let srv_handle = tokio::spawn(async move {
+        let _ = serve_with_listener(args, listener, srv_shared).await;
+    });
+
+    let mut client = connect_uds(sock_path.clone()).await?;
+    let sess = client
+        .create_session(CreateSessionRequest {
+            access_token: "test-bearer-control-append".to_string(),
+            expiry_unix_secs: 0,
+            quota_project: String::new(),
+        })
+        .await?
+        .into_inner();
+
+    // Test GetObject hit & NotFound
+    let mut get_hit = tonic::Request::new(GetObjectRequest {
+        bucket: "zonal-bkt".to_string(),
+        object: "present.bin".to_string(),
+        generation: 0,
+        if_generation_match: None,
+    });
+    get_hit
+        .metadata_mut()
+        .insert("x-session", sess.session_id.parse()?);
+    let got = client.get_object(get_hit).await?.into_inner();
+    assert_eq!(got.name, "present.bin");
+    assert_eq!(got.size, 4096);
+    assert_eq!(got.generation, 777);
+    assert_eq!(got.etag, "etag-777");
+    assert_eq!(got.crc32c, 0x12345678);
+
+    let mut get_miss = tonic::Request::new(GetObjectRequest {
+        bucket: "zonal-bkt".to_string(),
+        object: "missing.bin".to_string(),
+        generation: 0,
+        if_generation_match: None,
+    });
+    get_miss
+        .metadata_mut()
+        .insert("x-session", sess.session_id.parse()?);
+    assert_eq!(
+        client.get_object(get_miss).await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+
+    // Test DeleteObject hit & NotFound
+    let mut del_hit = tonic::Request::new(DeleteObjectRequest {
+        bucket: "zonal-bkt".to_string(),
+        object: "present.bin".to_string(),
+        generation: 0,
+        if_generation_match: None,
+    });
+    del_hit
+        .metadata_mut()
+        .insert("x-session", sess.session_id.parse()?);
+    client.delete_object(del_hit).await?;
+
+    let mut del_miss = tonic::Request::new(DeleteObjectRequest {
+        bucket: "zonal-bkt".to_string(),
+        object: "missing.bin".to_string(),
+        generation: 0,
+        if_generation_match: None,
+    });
+    del_miss
+        .metadata_mut()
+        .insert("x-session", sess.session_id.parse()?);
+    assert_eq!(
+        client.delete_object(del_miss).await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+
+    // Test AppendObject with intermediate Flush + Finalize
+    #[cfg(google_cloud_unstable_storage_bidi)]
+    {
+        let (ap_tx, ap_rx) = tokio::sync::mpsc::channel(8);
+        let mut ap_req = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(ap_rx));
+        ap_req
+            .metadata_mut()
+            .insert("x-session", sess.session_id.parse()?);
+        let start_fut = tokio::spawn(async move { client.append_object(ap_req).await });
+
+        ap_tx
+            .send(AppendRequest {
+                msg: Some(append_request::Msg::Header(WriteHeader {
+                    bucket: "zonal-bkt".to_string(),
+                    object: "append.bin".to_string(),
+                    content_type: "application/octet-stream".to_string(),
+                    if_generation_match: Some(0),
+                    known_size: None,
+                    chunk_size: 0,
+                    transport: Transport::Grpc as i32,
+                    appendable: true,
+                    finalize_on_close: Some(false),
+                    generation: None,
+                })),
+            })
+            .await?;
+
+        let mut ap_stream = start_fut.await??.into_inner();
+
+        ap_tx
+            .send(AppendRequest {
+                msg: Some(append_request::Msg::Data(Bytes::from_static(b"hello "))),
+            })
+            .await?;
+        ap_tx
+            .send(AppendRequest {
+                msg: Some(append_request::Msg::Flush(Empty {})),
+            })
+            .await?;
+
+        let flush_ack = ap_stream
+            .next()
+            .await
+            .expect("expected AppendResponse on Flush")?;
+        assert_eq!(flush_ack.persisted_size, 6);
+        assert_eq!(flush_ack.generation, 888);
+        assert!(!flush_ack.finalized);
+
+        ap_tx
+            .send(AppendRequest {
+                msg: Some(append_request::Msg::Data(Bytes::from_static(b"rapid!"))),
+            })
+            .await?;
+        ap_tx
+            .send(AppendRequest {
+                msg: Some(append_request::Msg::Finish(WriteFinish {
+                    finalize: false,
+                    expected_crc32c: None,
+                })),
+            })
+            .await?;
+        drop(ap_tx);
+
+        let unfin_ack = ap_stream
+            .next()
+            .await
+            .expect("expected unfinalized close AppendResponse")?;
+        assert_eq!(unfin_ack.persisted_size, 12);
+        assert_eq!(unfin_ack.generation, 888);
+        assert!(!unfin_ack.finalized);
+
+        // Reopen unfinalized appendable object by generation=888 and finalize with CRC32C check
+        let mut client2 = connect_uds(sock_path.clone()).await?;
+        let (re_tx, re_rx) = tokio::sync::mpsc::channel(8);
+        let mut re_req = tonic::Request::new(tokio_stream::wrappers::ReceiverStream::new(re_rx));
+        re_req
+            .metadata_mut()
+            .insert("x-session", sess.session_id.parse()?);
+        let re_fut = tokio::spawn(async move { client2.append_object(re_req).await });
+
+        re_tx
+            .send(AppendRequest {
+                msg: Some(append_request::Msg::Header(WriteHeader {
+                    bucket: "zonal-bkt".to_string(),
+                    object: "append.bin".to_string(),
+                    content_type: String::new(),
+                    if_generation_match: None,
+                    known_size: None,
+                    chunk_size: 0,
+                    transport: Transport::Grpc as i32,
+                    appendable: true,
+                    finalize_on_close: Some(true),
+                    generation: Some(888),
+                })),
+            })
+            .await?;
+
+        let mut re_stream = re_fut.await??.into_inner();
+        re_tx
+            .send(AppendRequest {
+                msg: Some(append_request::Msg::Data(Bytes::from_static(b"!!"))),
+            })
+            .await?;
+        re_tx
+            .send(AppendRequest {
+                msg: Some(append_request::Msg::Finish(WriteFinish {
+                    finalize: true,
+                    expected_crc32c: Some(0xCAFEBABE),
+                })),
+            })
+            .await?;
+        drop(re_tx);
+
+        let fin_ack = re_stream
+            .next()
+            .await
+            .expect("expected final AppendResponse")?;
+        assert_eq!(fin_ack.persisted_size, 14);
+        assert_eq!(fin_ack.generation, 888);
+        assert_eq!(fin_ack.crc32c, 0xCAFEBABE);
+        assert!(fin_ack.finalized);
+    }
+
+    let mut shutdown_client = connect_uds(sock_path.clone()).await?;
+    shutdown_client.shutdown(Empty {}).await?;
+    srv_handle.await?;
     Ok(())
 }

@@ -103,6 +103,9 @@ pub struct OpenObjectRequest {
     pub object: ::prost::alloc::string::String,
     #[prost(int64, tag = "3")]
     pub generation: i64,
+    /// Unset or < 0 = no precondition; 0 = DoesNotExist
+    #[prost(int64, optional, tag = "4")]
+    pub if_generation_match: ::core::option::Option<i64>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -150,11 +153,29 @@ pub struct WriteHeader {
     pub chunk_size: u32,
     #[prost(enumeration = "Transport", tag = "7")]
     pub transport: i32,
+    /// Requires gRPC BidiWriteObject appendable semantics (no JSON fallback)
+    #[prost(bool, tag = "8")]
+    pub appendable: bool,
+    /// Unset or true = finalize(); false = close() without finalizing
+    #[prost(bool, optional, tag = "9")]
+    pub finalize_on_close: ::core::option::Option<bool>,
+    /// > 0 reopens an existing unfinalized appendable object for takeover
+    #[prost(int64, optional, tag = "10")]
+    pub generation: ::core::option::Option<i64>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WriteFinish {
+    /// true = finalize(); false = close() without finalizing
+    #[prost(bool, tag = "1")]
+    pub finalize: bool,
+    #[prost(uint32, optional, tag = "2")]
+    pub expected_crc32c: ::core::option::Option<u32>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WriteRequest {
-    #[prost(oneof = "write_request::Msg", tags = "1, 2")]
+    #[prost(oneof = "write_request::Msg", tags = "1, 2, 3")]
     pub msg: ::core::option::Option<write_request::Msg>,
 }
 /// Nested message and enum types in `WriteRequest`.
@@ -166,7 +187,44 @@ pub mod write_request {
         Header(super::WriteHeader),
         #[prost(bytes, tag = "2")]
         Data(::prost::bytes::Bytes),
+        #[prost(message, tag = "3")]
+        Finish(super::WriteFinish),
     }
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AppendRequest {
+    #[prost(oneof = "append_request::Msg", tags = "1, 2, 3, 4")]
+    pub msg: ::core::option::Option<append_request::Msg>,
+}
+/// Nested message and enum types in `AppendRequest`.
+pub mod append_request {
+    #[allow(clippy::all)]
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Msg {
+        #[prost(message, tag = "1")]
+        Header(super::WriteHeader),
+        #[prost(bytes, tag = "2")]
+        Data(::prost::bytes::Bytes),
+        #[prost(message, tag = "3")]
+        Flush(super::Empty),
+        #[prost(message, tag = "4")]
+        Finish(super::WriteFinish),
+    }
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AppendResponse {
+    #[prost(int64, tag = "1")]
+    pub persisted_size: i64,
+    #[prost(int64, tag = "2")]
+    pub generation: i64,
+    #[prost(uint32, tag = "3")]
+    pub crc32c: u32,
+    #[prost(bool, tag = "4")]
+    pub finalized: bool,
+    #[prost(message, optional, tag = "5")]
+    pub meta: ::core::option::Option<ObjectMeta>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -219,6 +277,10 @@ pub struct ListedObject {
     pub updated_unix_secs: i64,
     #[prost(uint32, tag = "8")]
     pub crc32c: u32,
+    #[prost(string, tag = "9")]
+    pub content_encoding: ::prost::alloc::string::String,
+    #[prost(string, tag = "10")]
+    pub etag: ::prost::alloc::string::String,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -263,6 +325,30 @@ pub struct ListBucketsResponse {
     pub items: ::prost::alloc::vec::Vec<ListedBucket>,
     #[prost(string, tag = "2")]
     pub next_page_token: ::prost::alloc::string::String,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetObjectRequest {
+    #[prost(string, tag = "1")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub generation: i64,
+    #[prost(int64, optional, tag = "4")]
+    pub if_generation_match: ::core::option::Option<i64>,
+}
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteObjectRequest {
+    #[prost(string, tag = "1")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub object: ::prost::alloc::string::String,
+    #[prost(int64, tag = "3")]
+    pub generation: i64,
+    #[prost(int64, optional, tag = "4")]
+    pub if_generation_match: ::core::option::Option<i64>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -579,6 +665,33 @@ pub mod gcs_core_client {
                 .insert(GrpcMethod::new("gcscore.v1.GcsCore", "WriteObject"));
             self.inner.client_streaming(req, path, codec).await
         }
+        /// Bidirectional appendable upload session (BidiWriteObject over gRPC) supporting
+        /// incremental GCS-acknowledged `flush`, takeover by `generation`, and close-time
+        /// `finalize` vs `closeWithoutFinalizing` semantics.
+        pub async fn append_object(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = super::AppendRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::AppendResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/gcscore.v1.GcsCore/AppendObject",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("gcscore.v1.GcsCore", "AppendObject"));
+            self.inner.streaming(req, path, codec).await
+        }
         /// Single-page control-plane listing (mirrors language SDK iterators / PageInfo).
         pub async fn list_objects(
             &mut self,
@@ -626,6 +739,49 @@ pub mod gcs_core_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("gcscore.v1.GcsCore", "ListBuckets"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Control-plane single-object metadata lookup and deletion.
+        pub async fn get_object(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetObjectRequest>,
+        ) -> std::result::Result<tonic::Response<super::ListedObject>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/gcscore.v1.GcsCore/GetObject",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("gcscore.v1.GcsCore", "GetObject"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn delete_object(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteObjectRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/gcscore.v1.GcsCore/DeleteObject",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("gcscore.v1.GcsCore", "DeleteObject"));
             self.inner.unary(req, path, codec).await
         }
         /// Linux shared-memory zero-copy read data plane: the client obtains a sealed
@@ -831,6 +987,22 @@ pub mod gcs_core_server {
             tonic::Response<super::WriteObjectResponse>,
             tonic::Status,
         >;
+        /// Server streaming response type for the AppendObject method.
+        type AppendObjectStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::AppendResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Bidirectional appendable upload session (BidiWriteObject over gRPC) supporting
+        /// incremental GCS-acknowledged `flush`, takeover by `generation`, and close-time
+        /// `finalize` vs `closeWithoutFinalizing` semantics.
+        async fn append_object(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::AppendRequest>>,
+        ) -> std::result::Result<
+            tonic::Response<Self::AppendObjectStream>,
+            tonic::Status,
+        >;
         /// Single-page control-plane listing (mirrors language SDK iterators / PageInfo).
         async fn list_objects(
             &self,
@@ -846,6 +1018,15 @@ pub mod gcs_core_server {
             tonic::Response<super::ListBucketsResponse>,
             tonic::Status,
         >;
+        /// Control-plane single-object metadata lookup and deletion.
+        async fn get_object(
+            &self,
+            request: tonic::Request<super::GetObjectRequest>,
+        ) -> std::result::Result<tonic::Response<super::ListedObject>, tonic::Status>;
+        async fn delete_object(
+            &self,
+            request: tonic::Request<super::DeleteObjectRequest>,
+        ) -> std::result::Result<tonic::Response<super::Empty>, tonic::Status>;
         /// Server streaming response type for the ReadObjectShm method.
         type ReadObjectShmStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::ShmChunk, tonic::Status>,
@@ -1241,6 +1422,54 @@ pub mod gcs_core_server {
                     };
                     Box::pin(fut)
                 }
+                "/gcscore.v1.GcsCore/AppendObject" => {
+                    #[allow(non_camel_case_types)]
+                    struct AppendObjectSvc<T: GcsCore>(pub Arc<T>);
+                    impl<
+                        T: GcsCore,
+                    > tonic::server::StreamingService<super::AppendRequest>
+                    for AppendObjectSvc<T> {
+                        type Response = super::AppendResponse;
+                        type ResponseStream = T::AppendObjectStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::AppendRequest>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as GcsCore>::append_object(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AppendObjectSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/gcscore.v1.GcsCore/ListObjects" => {
                     #[allow(non_camel_case_types)]
                     struct ListObjectsSvc<T: GcsCore>(pub Arc<T>);
@@ -1316,6 +1545,94 @@ pub mod gcs_core_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ListBucketsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/gcscore.v1.GcsCore/GetObject" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetObjectSvc<T: GcsCore>(pub Arc<T>);
+                    impl<T: GcsCore> tonic::server::UnaryService<super::GetObjectRequest>
+                    for GetObjectSvc<T> {
+                        type Response = super::ListedObject;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetObjectRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as GcsCore>::get_object(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetObjectSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/gcscore.v1.GcsCore/DeleteObject" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteObjectSvc<T: GcsCore>(pub Arc<T>);
+                    impl<
+                        T: GcsCore,
+                    > tonic::server::UnaryService<super::DeleteObjectRequest>
+                    for DeleteObjectSvc<T> {
+                        type Response = super::Empty;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeleteObjectRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as GcsCore>::delete_object(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteObjectSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

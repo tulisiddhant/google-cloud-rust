@@ -29,6 +29,17 @@ extern "C" {
 // Returns `0` on success, or `-1` on error.
 int32_t gcs_core_start_inproc(const char* socket_path);
 
+// Starts the `gcscore.v1.GcsCore` gRPC-over-UDS server in-process with explicit
+// transport ("grpc" or "json"; NULL defaults to "grpc"), `grpc_subchannels`
+// (<= 0 uses available vCPUs, min 4), and optional custom `endpoint` (NULL for
+// default GCS endpoint).
+// Returns `0` on success, or `-1` on error.
+int32_t gcs_core_start_inproc_with_options(
+    const char* socket_path,
+    const char* default_transport,
+    int32_t grpc_subchannels,
+    const char* endpoint);
+
 // Triggers graceful shutdown of the in-process server listening on
 // `socket_path` and blocks until its background Tokio runtime thread exits.
 // Returns `0` on success, or `-1` if no server is registered for `socket_path`.

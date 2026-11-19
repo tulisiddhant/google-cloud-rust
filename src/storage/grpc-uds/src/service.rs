@@ -89,13 +89,29 @@ impl GcsCoreService {
         };
         let mut sb = Storage::builder().with_grpc_subchannel_count(subchannels);
         let mut cb = StorageControl::builder();
+        let is_loopback_http = args.endpoint.as_deref().is_some_and(|e| {
+            e.starts_with("http://127.0.0.1")
+                || e.starts_with("http://localhost")
+                || e.starts_with("http://[::1]")
+        });
+        if args.require_session || is_loopback_http {
+            let anon = google_cloud_auth::credentials::anonymous::Builder::new().build();
+            sb = sb.with_credentials(anon.clone());
+            cb = cb.with_credentials(anon);
+        }
         if let Some(e) = &args.endpoint {
             sb = sb.with_endpoint(e.clone());
-            cb = cb.with_endpoint(e.clone());
+        }
+        if let Some(ce) = args.control_endpoint.as_ref().or(args.endpoint.as_ref()) {
+            cb = cb.with_endpoint(ce.clone());
         }
         Ok(Self {
             shm,
-            sessions: Arc::new(Sessions::new(args.endpoint.clone(), subchannels)),
+            sessions: Arc::new(Sessions::with_control_endpoint(
+                args.endpoint.clone(),
+                args.control_endpoint.clone(),
+                subchannels,
+            )),
             require_session: args.require_session,
             storage: sb.build().await?,
             control: cb.build().await?,
@@ -271,6 +287,21 @@ fn meta_from_object(o: &google_cloud_storage::model::Object) -> pb::ObjectMeta {
     }
 }
 
+fn listed_from_object(o: &google_cloud_storage::model::Object) -> pb::ListedObject {
+    pb::ListedObject {
+        name: o.name.clone(),
+        size: o.size,
+        generation: o.generation,
+        metageneration: o.metageneration,
+        content_type: o.content_type.clone(),
+        storage_class: o.storage_class.clone(),
+        updated_unix_secs: o.update_time.as_ref().map(|t| t.seconds()).unwrap_or(0),
+        crc32c: o.checksums.as_ref().and_then(|c| c.crc32c).unwrap_or(0),
+        content_encoding: o.content_encoding.clone(),
+        etag: o.etag.clone(),
+    }
+}
+
 async fn pump_reader(
     mut resp: google_cloud_storage::read_object::ReadObjectResponse,
     first_meta: Option<pb::ObjectMeta>,
@@ -339,6 +370,7 @@ impl GcsCore for GcsCoreService {
     type ReadObjectStream = RespStream<pb::ReadChunk>;
     type ReadRangeStream = RespStream<pb::ReadChunk>;
     type ReadObjectShmStream = RespStream<pb::ShmChunk>;
+    type AppendObjectStream = RespStream<pb::AppendResponse>;
 
     async fn ping(
         &self,
@@ -531,6 +563,9 @@ impl GcsCore for GcsCoreService {
         if r.generation > 0 {
             open = open.set_generation(r.generation);
         }
+        if let Some(g) = r.if_generation_match.filter(|&g| g >= 0) {
+            open = open.set_if_generation_match(g);
+        }
         let desc = open.send().await.map_err(to_status)?;
         let meta = meta_from_object(&desc.object());
         let h = self.next_handle.fetch_add(1, Ordering::Relaxed);
@@ -614,37 +649,85 @@ impl GcsCore for GcsCoreService {
         let bucket = bucket_name(&header.bucket);
         let object = header.object.clone();
 
+        #[cfg(not(google_cloud_unstable_storage_bidi))]
+        if header.appendable {
+            return Err(Status::unimplemented(
+                "gcs-core-server built without google_cloud_unstable_storage_bidi",
+            ));
+        }
+
         #[cfg(google_cloud_unstable_storage_bidi)]
-        if self.use_grpc(header.transport) {
-            let mut open = storage.open_appendable_object(bucket.clone(), object.clone());
-            if !header.content_type.is_empty() {
-                open = open.set_content_type(header.content_type.clone());
-            }
-            if let Some(g) = header.if_generation_match.filter(|&g| g >= 0) {
-                open = open.set_if_generation_match(g);
-            }
-            match open.send().await {
+        if header.appendable || self.use_grpc(header.transport) {
+            let open_res = if let Some(reopen_gen) = header.generation.filter(|&g| g > 0) {
+                storage
+                    .reopen_appendable_object(bucket.clone(), object.clone(), reopen_gen)
+                    .send()
+                    .await
+            } else {
+                let mut open = storage.open_appendable_object(bucket.clone(), object.clone());
+                if !header.content_type.is_empty() {
+                    open = open.set_content_type(header.content_type.clone());
+                }
+                if let Some(g) = header.if_generation_match.filter(|&g| g >= 0) {
+                    open = open.set_if_generation_match(g);
+                }
+                open.send().await
+            };
+            match open_res {
                 Ok(mut w) => {
+                    let mut finish_override: Option<pb::WriteFinish> = None;
                     while let Some(m) = inbound.message().await? {
-                        if let Some(pb::write_request::Msg::Data(d)) = m.msg {
-                            w.append(d).await.map_err(to_status)?;
+                        match m.msg {
+                            Some(pb::write_request::Msg::Data(d)) => {
+                                w.append(d).await.map_err(to_status)?;
+                            }
+                            Some(pb::write_request::Msg::Finish(fin)) => {
+                                finish_override = Some(fin);
+                                break;
+                            }
+                            _ => {}
                         }
                     }
-                    let obj = w.finalize().await.map_err(to_status)?;
-                    return Ok(Response::new(pb::WriteObjectResponse {
-                        size: obj.size,
-                        generation: obj.generation,
-                        crc32c: obj.checksums.as_ref().and_then(|c| c.crc32c).unwrap_or(0),
-                        transport_used: pb::Transport::Grpc as i32,
-                    }));
+                    let should_finalize = finish_override
+                        .as_ref()
+                        .map(|f| f.finalize)
+                        .or(header.finalize_on_close)
+                        .unwrap_or(true);
+                    let expected_crc = finish_override.and_then(|f| f.expected_crc32c);
+                    if should_finalize {
+                        let obj = w.finalize().await.map_err(to_status)?;
+                        let crc32c = obj.checksums.as_ref().and_then(|c| c.crc32c).unwrap_or(0);
+                        if let Some(exp) = expected_crc
+                            && crc32c != exp
+                        {
+                            return Err(Status::invalid_argument(format!(
+                                "CRC32C mismatch on finalize: expected {exp:#010x}, actual {crc32c:#010x}"
+                            )));
+                        }
+                        return Ok(Response::new(pb::WriteObjectResponse {
+                            size: obj.size,
+                            generation: obj.generation,
+                            crc32c,
+                            transport_used: pb::Transport::Grpc as i32,
+                        }));
+                    } else {
+                        let generation = w.generation();
+                        let persisted = w.close().await.map_err(to_status)?;
+                        return Ok(Response::new(pb::WriteObjectResponse {
+                            size: persisted,
+                            generation,
+                            crc32c: 0,
+                            transport_used: pb::Transport::Grpc as i32,
+                        }));
+                    }
                 }
                 Err(e) => {
                     let st = to_status(e);
-                    if st.code() != tonic::Code::Unimplemented {
+                    if header.appendable || st.code() != tonic::Code::Unimplemented {
                         return Err(st);
                     }
-                    // Standard regional buckets reject appendable objects with UNIMPLEMENTED;
-                    // fall back transparently to write_object.
+                    // Standard regional buckets reject non-appendable gRPC writes with UNIMPLEMENTED;
+                    // fall back transparently to write_object only when appendable == false.
                 }
             }
         }
@@ -728,23 +811,196 @@ impl GcsCore for GcsCoreService {
         }
         let resp = q.send().await.map_err(to_status)?;
         Ok(Response::new(pb::ListObjectsResponse {
-            items: resp
-                .objects
-                .iter()
-                .map(|o| pb::ListedObject {
-                    name: o.name.clone(),
-                    size: o.size,
-                    generation: o.generation,
-                    metageneration: o.metageneration,
-                    content_type: o.content_type.clone(),
-                    storage_class: o.storage_class.clone(),
-                    updated_unix_secs: o.update_time.as_ref().map(|t| t.seconds()).unwrap_or(0),
-                    crc32c: o.checksums.as_ref().and_then(|c| c.crc32c).unwrap_or(0),
-                })
-                .collect(),
+            items: resp.objects.iter().map(listed_from_object).collect(),
             prefixes: resp.prefixes,
             next_page_token: resp.next_page_token,
         }))
+    }
+
+    async fn append_object(
+        &self,
+        req: Request<Streaming<pb::AppendRequest>>,
+    ) -> Result<Response<Self::AppendObjectStream>, Status> {
+        self.shared.touch();
+        #[cfg(not(google_cloud_unstable_storage_bidi))]
+        {
+            let _ = req;
+            Err(Status::unimplemented(
+                "gcs-core-server built without google_cloud_unstable_storage_bidi",
+            ))
+        }
+        #[cfg(google_cloud_unstable_storage_bidi)]
+        {
+            let (storage, _) = self.pick(&req).await?;
+            let mut inbound = req.into_inner();
+            let header = match inbound.message().await? {
+                Some(pb::AppendRequest {
+                    msg: Some(pb::append_request::Msg::Header(h)),
+                }) => h,
+                _ => return Err(Status::invalid_argument("first message must be header")),
+            };
+            let bucket = bucket_name(&header.bucket);
+            let object = header.object.clone();
+            let mut w = if let Some(reopen_gen) = header.generation.filter(|&g| g > 0) {
+                storage
+                    .reopen_appendable_object(bucket, object, reopen_gen)
+                    .send()
+                    .await
+                    .map_err(to_status)?
+            } else {
+                let mut open = storage.open_appendable_object(bucket, object);
+                if !header.content_type.is_empty() {
+                    open = open.set_content_type(header.content_type.clone());
+                }
+                if let Some(g) = header.if_generation_match.filter(|&g| g >= 0) {
+                    open = open.set_if_generation_match(g);
+                }
+                open.send().await.map_err(to_status)?
+            };
+
+            let (tx, rx) = mpsc::channel::<Result<pb::AppendResponse, Status>>(16);
+            tokio::spawn(async move {
+                let mut finish_override: Option<pb::WriteFinish> = None;
+                loop {
+                    match inbound.message().await {
+                        Ok(Some(m)) => match m.msg {
+                            Some(pb::append_request::Msg::Data(d)) => {
+                                if let Err(e) = w.append(d).await {
+                                    let _ = tx.send(Err(to_status(e))).await;
+                                    return;
+                                }
+                            }
+                            Some(pb::append_request::Msg::Flush(_)) => match w.flush().await {
+                                Ok(persisted) => {
+                                    let msg = pb::AppendResponse {
+                                        persisted_size: persisted,
+                                        generation: w.generation(),
+                                        crc32c: 0,
+                                        finalized: false,
+                                        meta: None,
+                                    };
+                                    if tx.send(Ok(msg)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(to_status(e))).await;
+                                    return;
+                                }
+                            },
+                            Some(pb::append_request::Msg::Finish(fin)) => {
+                                finish_override = Some(fin);
+                                break;
+                            }
+                            _ => {}
+                        },
+                        Ok(None) => break,
+                        Err(st) => {
+                            let _ = tx.send(Err(st)).await;
+                            return;
+                        }
+                    }
+                }
+
+                let should_finalize = finish_override
+                    .as_ref()
+                    .map(|f| f.finalize)
+                    .or(header.finalize_on_close)
+                    .unwrap_or(false);
+                let expected_crc = finish_override.and_then(|f| f.expected_crc32c);
+                if should_finalize {
+                    match w.finalize().await {
+                        Ok(obj) => {
+                            let crc32c =
+                                obj.checksums.as_ref().and_then(|c| c.crc32c).unwrap_or(0);
+                            if let Some(exp) = expected_crc
+                                && crc32c != exp
+                            {
+                                let _ = tx
+                                    .send(Err(Status::invalid_argument(format!(
+                                        "CRC32C mismatch on finalize: expected {exp:#010x}, actual {crc32c:#010x}"
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                            let _ = tx
+                                .send(Ok(pb::AppendResponse {
+                                    persisted_size: obj.size,
+                                    generation: obj.generation,
+                                    crc32c,
+                                    finalized: true,
+                                    meta: Some(meta_from_object(&obj)),
+                                }))
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(to_status(e))).await;
+                        }
+                    }
+                } else {
+                    let generation = w.generation();
+                    match w.close().await {
+                        Ok(persisted) => {
+                            let _ = tx
+                                .send(Ok(pb::AppendResponse {
+                                    persisted_size: persisted,
+                                    generation,
+                                    crc32c: 0,
+                                    finalized: false,
+                                    meta: None,
+                                }))
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(to_status(e))).await;
+                        }
+                    }
+                }
+            });
+            Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        }
+    }
+
+    async fn get_object(
+        &self,
+        req: Request<pb::GetObjectRequest>,
+    ) -> Result<Response<pb::ListedObject>, Status> {
+        self.shared.touch();
+        let (_, control) = self.pick(&req).await?;
+        let r = req.into_inner();
+        let mut q = control
+            .get_object()
+            .set_bucket(bucket_name(&r.bucket))
+            .set_object(r.object);
+        if r.generation > 0 {
+            q = q.set_generation(r.generation);
+        }
+        if let Some(g) = r.if_generation_match.filter(|&g| g >= 0) {
+            q = q.set_if_generation_match(g);
+        }
+        let obj = q.send().await.map_err(to_status)?;
+        Ok(Response::new(listed_from_object(&obj)))
+    }
+
+    async fn delete_object(
+        &self,
+        req: Request<pb::DeleteObjectRequest>,
+    ) -> Result<Response<pb::Empty>, Status> {
+        self.shared.touch();
+        let (_, control) = self.pick(&req).await?;
+        let r = req.into_inner();
+        let mut q = control
+            .delete_object()
+            .set_bucket(bucket_name(&r.bucket))
+            .set_object(r.object);
+        if r.generation > 0 {
+            q = q.set_generation(r.generation);
+        }
+        if let Some(g) = r.if_generation_match.filter(|&g| g >= 0) {
+            q = q.set_if_generation_match(g);
+        }
+        q.send().await.map_err(to_status)?;
+        Ok(Response::new(pb::Empty {}))
     }
 
     async fn list_buckets(

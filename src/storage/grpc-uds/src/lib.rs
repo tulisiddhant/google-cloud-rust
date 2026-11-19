@@ -137,6 +137,10 @@ pub struct Args {
     #[arg(long)]
     pub endpoint: Option<String>,
 
+    /// Optional explicit GCS control-plane endpoint URL (defaults to `--endpoint` when unset).
+    #[arg(long)]
+    pub control_endpoint: Option<String>,
+
     /// Optional additional TCP listen address (`host:port`) for UDS-vs-TCP microbenchmarks.
     #[arg(long)]
     pub tcp: Option<String>,
@@ -161,6 +165,7 @@ impl Default for Args {
             peer_uid_check: true,
             chunk_size: 2 * 1024 * 1024,
             endpoint: None,
+            control_endpoint: None,
             tcp: None,
             require_session: false,
             shm_size: 256 * 1024 * 1024,
@@ -479,6 +484,90 @@ static INPROC_SERVERS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, InprocHandle>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Starts the `GcsCore` gRPC-over-UDS server in-process on a background Tokio runtime thread
+/// using the supplied [`Args`]. Returns `0` once the UDS listener is bound and ready to accept
+/// connections, or `-1` on error.
+pub fn start_inproc_with_args(mut args: Args) -> i32 {
+    args.idle_secs = 0;
+    let sock = args.socket.clone();
+    let shared = Shared::new();
+    let srv_shared = shared.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<i32>(1);
+    let join = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("gcs-core-inproc")
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("gcs-core-inproc failed to build tokio runtime: {e}");
+                let _ = tx.send(-1);
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let listener = match bind_uds_listener(&args.socket) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!(
+                        "gcs-core-inproc failed to bind UDS listener {}: {e}",
+                        args.socket
+                    );
+                    let _ = tx.send(-1);
+                    return;
+                }
+            };
+            let _ = tx.send(0);
+            if let Err(e) = serve_with_listener(args, listener, srv_shared).await {
+                tracing::error!("gcs-core-inproc server exited with error: {e}");
+            }
+        });
+    });
+    let rc = rx.recv().unwrap_or(-1);
+    if rc == 0 {
+        INPROC_SERVERS.lock().unwrap().insert(
+            sock,
+            InprocHandle {
+                shared,
+                join: Some(join),
+            },
+        );
+    } else {
+        let _ = join.join();
+    }
+    rc
+}
+
+/// Triggers graceful shutdown of an in-process gRPC-over-UDS server listening on `sock` and waits
+/// for its background Tokio runtime thread to exit. Returns `0` on success or `-1` if not found.
+pub fn stop_inproc_by_socket(sock: &str) -> i32 {
+    let handle = INPROC_SERVERS.lock().unwrap().remove(sock);
+    match handle {
+        Some(mut h) => {
+            h.shared.trigger_shutdown();
+            if let Some(j) = h.join.take() {
+                let _ = j.join();
+            }
+            0
+        }
+        None => -1,
+    }
+}
+
+unsafe fn opt_cstr(ptr: *const c_char) -> Result<Option<String>, std::str::Utf8Error> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: Caller guarantees non-null `ptr` points to a valid NUL-terminated C string.
+    let s = unsafe { CStr::from_ptr(ptr) }.to_str()?;
+    if s.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(s.to_owned()))
+    }
+}
+
 /// C-FFI entry point for launching the gRPC-over-UDS server **in-process** on a background
 /// Tokio runtime thread. Returns `0` once the UDS listener is bound and ready to accept connections,
 /// or `-1` on error.
@@ -488,64 +577,64 @@ static INPROC_SERVERS: std::sync::LazyLock<
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gcs_core_start_inproc(socket_path: *const c_char) -> i32 {
     std::panic::catch_unwind(|| {
-        if socket_path.is_null() {
+        let Some(sock) = (unsafe { opt_cstr(socket_path) }).ok().flatten() else {
             return -1;
-        }
-        // SAFETY: The caller guarantees `socket_path` is a non-null, NUL-terminated C string.
-        let sock = match unsafe { CStr::from_ptr(socket_path) }.to_str() {
-            Ok(s) => s.to_owned(),
+        };
+        start_inproc_with_args(Args {
+            socket: sock,
+            idle_secs: 0,
+            ..Default::default()
+        })
+    })
+    .unwrap_or(-1)
+}
+
+/// C-FFI entry point for launching the gRPC-over-UDS server **in-process** with explicit
+/// upstream transport (`"grpc"` or `"json"`; NULL defaults to `"grpc"`), `grpc_subchannels`
+/// (`<= 0` uses available vCPUs, min 4), and optional `endpoint` override.
+///
+/// # Safety
+/// Non-null string pointers must reference valid NUL-terminated C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gcs_core_start_inproc_with_options(
+    socket_path: *const c_char,
+    default_transport: *const c_char,
+    grpc_subchannels: i32,
+    endpoint: *const c_char,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let Some(sock) = (unsafe { opt_cstr(socket_path) }).ok().flatten() else {
+            return -1;
+        };
+        let transport = match unsafe { opt_cstr(default_transport) } {
+            Ok(Some(t)) => t,
+            Ok(None) => "grpc".to_string(),
             Err(_) => return -1,
         };
-        let shared = Shared::new();
-        let srv_shared = shared.clone();
-        let srv_sock = sock.clone();
-        let (tx, rx) = std::sync::mpsc::sync_channel::<i32>(1);
-        let join = std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .thread_name("gcs-core-inproc")
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(_) => {
-                    let _ = tx.send(-1);
-                    return;
-                }
-            };
-            rt.block_on(async move {
-                let args = Args {
-                    socket: srv_sock,
-                    idle_secs: 0,
-                    ..Default::default()
-                };
-                let listener = match bind_uds_listener(&args.socket) {
-                    Ok(l) => l,
-                    Err(_) => {
-                        let _ = tx.send(-1);
-                        return;
-                    }
-                };
-                let _ = tx.send(0);
-                let _ = serve_with_listener(args, listener, srv_shared).await;
-            });
-        });
-        let rc = rx.recv().unwrap_or(-1);
-        if rc == 0 {
-            INPROC_SERVERS.lock().unwrap().insert(
-                sock,
-                InprocHandle {
-                    shared,
-                    join: Some(join),
-                },
-            );
-        }
-        rc
+        let endpoint_opt = match unsafe { opt_cstr(endpoint) } {
+            Ok(e) => e,
+            Err(_) => return -1,
+        };
+        let subchannels = if grpc_subchannels > 0 {
+            grpc_subchannels as usize
+        } else {
+            0
+        };
+        start_inproc_with_args(Args {
+            socket: sock,
+            idle_secs: 0,
+            default_transport: transport,
+            grpc_subchannels: subchannels,
+            endpoint: endpoint_opt,
+            ..Default::default()
+        })
     })
     .unwrap_or(-1)
 }
 
 /// C-FFI entry point for stopping an in-process gRPC-over-UDS server previously started via
-/// [`gcs_core_start_inproc`] and waiting for its background Tokio runtime thread to exit.
+/// [`gcs_core_start_inproc`] or [`gcs_core_start_inproc_with_options`] and waiting for its
+/// background Tokio runtime thread to exit.
 /// Returns `0` on clean shutdown or `-1` if no in-process server was registered for `socket_path`.
 ///
 /// # Safety
@@ -561,17 +650,7 @@ pub unsafe extern "C" fn gcs_core_stop_inproc(socket_path: *const c_char) -> i32
             Ok(s) => s,
             Err(_) => return -1,
         };
-        let handle = INPROC_SERVERS.lock().unwrap().remove(sock);
-        match handle {
-            Some(mut h) => {
-                h.shared.trigger_shutdown();
-                if let Some(j) = h.join.take() {
-                    let _ = j.join();
-                }
-                0
-            }
-            None => -1,
-        }
+        stop_inproc_by_socket(sock)
     })
     .unwrap_or(-1)
 }

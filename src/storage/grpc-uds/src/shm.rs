@@ -261,6 +261,12 @@ impl Registry {
                     ));
                 }
             }
+            if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("another shm server is already listening on {path}"),
+                ));
+            }
             let _ = std::fs::remove_file(&path);
         }
         let listener = UnixListener::bind(&path)?;

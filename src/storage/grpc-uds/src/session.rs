@@ -118,6 +118,7 @@ pub struct Session {
 pub struct Sessions {
     map: Mutex<HashMap<String, Arc<Session>>>,
     endpoint: Option<String>,
+    control_endpoint: Option<String>,
     subchannels: usize,
 }
 
@@ -143,9 +144,19 @@ fn random_id() -> Result<String, String> {
 impl Sessions {
     /// Creates a new session registry.
     pub fn new(endpoint: Option<String>, subchannels: usize) -> Self {
+        Self::with_control_endpoint(endpoint, None, subchannels)
+    }
+
+    /// Creates a new session registry with an optional separate control-plane endpoint.
+    pub fn with_control_endpoint(
+        endpoint: Option<String>,
+        control_endpoint: Option<String>,
+        subchannels: usize,
+    ) -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
             endpoint,
+            control_endpoint,
             subchannels,
         }
     }
@@ -167,7 +178,9 @@ impl Sessions {
         let mut cb = StorageControl::builder().with_credentials(creds);
         if let Some(e) = &self.endpoint {
             sb = sb.with_endpoint(e.clone());
-            cb = cb.with_endpoint(e.clone());
+        }
+        if let Some(ce) = self.control_endpoint.as_ref().or(self.endpoint.as_ref()) {
+            cb = cb.with_endpoint(ce.clone());
         }
         let storage = sb.build().await.map_err(|e| e.to_string())?;
         let control = cb.build().await.map_err(|e| e.to_string())?;
