@@ -654,3 +654,125 @@ pub unsafe extern "C" fn gcs_core_stop_inproc(socket_path: *const c_char) -> i32
     })
     .unwrap_or(-1)
 }
+
+#[cfg(feature = "jni")]
+mod jni_bridge {
+    use super::{Args, start_inproc_with_args, stop_inproc_by_socket};
+    use jni::EnvUnowned;
+    use jni::errors::ThrowRuntimeExAndDefault;
+    use jni::objects::{JClass, JString};
+    use jni::sys::{jboolean, jint};
+
+    fn jstring_to_option(
+        env: &jni::Env<'_>,
+        s: &JString<'_>,
+    ) -> Result<Option<String>, jni::errors::Error> {
+        if s.is_null() {
+            return Ok(None);
+        }
+        let chars = s.mutf8_chars(env)?;
+        let val = chars.to_str().into_owned();
+        if val.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(val))
+        }
+    }
+
+    /// JNI entry point for `com.google.cloud.storage.sidecar.RustInprocSidecarManager.startInprocNative`.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_google_cloud_storage_sidecar_RustInprocSidecarManager_startInprocNative<
+        'caller,
+    >(
+        mut unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+        socket_path: JString<'caller>,
+        default_transport: JString<'caller>,
+        grpc_subchannels: jint,
+        endpoint: JString<'caller>,
+    ) -> jint {
+        let outcome = unowned_env.with_env(|env| -> Result<jint, jni::errors::Error> {
+            let Some(sock) = jstring_to_option(env, &socket_path)? else {
+                return Ok(-1);
+            };
+            let transport = jstring_to_option(env, &default_transport)?
+                .unwrap_or_else(|| "grpc".to_string());
+            let endpoint_opt = jstring_to_option(env, &endpoint)?;
+            let subchannels = if grpc_subchannels > 0 {
+                grpc_subchannels as usize
+            } else {
+                0
+            };
+            let args = Args {
+                socket: sock,
+                idle_secs: 0,
+                default_transport: transport,
+                grpc_subchannels: subchannels,
+                endpoint: endpoint_opt,
+                ..Default::default()
+            };
+            Ok(start_inproc_with_args(args))
+        });
+        outcome.resolve::<ThrowRuntimeExAndDefault>()
+    }
+
+    /// Extended JNI entry point supporting separate `control_endpoint` and `require_session`.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_google_cloud_storage_sidecar_RustInprocSidecarManager_startInprocWithOptionsNative<
+        'caller,
+    >(
+        mut unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+        socket_path: JString<'caller>,
+        default_transport: JString<'caller>,
+        grpc_subchannels: jint,
+        endpoint: JString<'caller>,
+        control_endpoint: JString<'caller>,
+        require_session: jboolean,
+    ) -> jint {
+        let outcome = unowned_env.with_env(|env| -> Result<jint, jni::errors::Error> {
+            let Some(sock) = jstring_to_option(env, &socket_path)? else {
+                return Ok(-1);
+            };
+            let transport = jstring_to_option(env, &default_transport)?
+                .unwrap_or_else(|| "grpc".to_string());
+            let endpoint_opt = jstring_to_option(env, &endpoint)?;
+            let control_endpoint_opt = jstring_to_option(env, &control_endpoint)?;
+            let subchannels = if grpc_subchannels > 0 {
+                grpc_subchannels as usize
+            } else {
+                0
+            };
+            let args = Args {
+                socket: sock,
+                idle_secs: 0,
+                default_transport: transport,
+                grpc_subchannels: subchannels,
+                endpoint: endpoint_opt,
+                control_endpoint: control_endpoint_opt,
+                require_session,
+                ..Default::default()
+            };
+            Ok(start_inproc_with_args(args))
+        });
+        outcome.resolve::<ThrowRuntimeExAndDefault>()
+    }
+
+    /// JNI entry point for `com.google.cloud.storage.sidecar.RustInprocSidecarManager.stopInprocNative`.
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_google_cloud_storage_sidecar_RustInprocSidecarManager_stopInprocNative<
+        'caller,
+    >(
+        mut unowned_env: EnvUnowned<'caller>,
+        _class: JClass<'caller>,
+        socket_path: JString<'caller>,
+    ) -> jint {
+        let outcome = unowned_env.with_env(|env| -> Result<jint, jni::errors::Error> {
+            let Some(sock) = jstring_to_option(env, &socket_path)? else {
+                return Ok(-1);
+            };
+            Ok(stop_inproc_by_socket(&sock))
+        });
+        outcome.resolve::<ThrowRuntimeExAndDefault>()
+    }
+}

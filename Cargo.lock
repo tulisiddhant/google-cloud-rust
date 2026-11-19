@@ -9650,6 +9650,7 @@ dependencies = [
  "http",
  "httptest",
  "hyper-util",
+ "jni",
  "libc",
  "prost",
  "serde_json",
